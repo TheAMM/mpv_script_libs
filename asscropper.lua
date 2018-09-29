@@ -19,6 +19,7 @@ function ASSCropper.new(display_state)
   self.keybind_group = script_name .. "_asscropper_binds"
   self.cropdetect_label = script_name .. "_asscropper_cropdetect"
   self.blackframe_label = script_name .. "_asscropper_blackframe"
+  self.crop_label = script_name .. "_asscropper_crop"
 
   self.display_state = display_state
 
@@ -65,6 +66,8 @@ function ASSCropper.new(display_state)
   self.drag_start = {x=0, y=0}
   self.restrict_ratio = false
 
+  self.testing_crop = false
+
   self.detecting_crop = nil
   self.cropdetect_wait = nil
   self.cropdetect_timeout = nil
@@ -73,29 +76,81 @@ function ASSCropper.new(display_state)
   self.blackframe_wait = nil
   self.blackframe_timeout = nil
 
-  local listeners = {
-    {"mouse_move", function()  self:update_mouse_position() end },
-    {"mouse_btn0", function(e) self:on_mouse("mouse_btn0", false) end, function(e) self:on_mouse("mouse_btn0", true) end},
-    {"shift+mouse_btn0", function(e) self:on_mouse("mouse_btn0", false, true) end, function(e) self:on_mouse("mouse_btn0", true, true) end},
-    {"c", function() self:key_event("CROSSHAIR") end },
-    {"d", function() self:key_event("CROP_DETECT") end },
-    {"x", function() self:key_event("GUIDES") end },
-    {"z", function() self:key_event("INVERT") end },
-    {"ENTER", function() self:key_event("ENTER") end },
-    {"ESC", function() self:key_event("ESC") end }
+  self.nudges = {
+    NUDGE_LEFT  = {-1,  0, -1,  0},
+    NUDGE_UP    = { 0, -1,  0, -1},
+    NUDGE_RIGHT = { 1,  0,  1,  0},
+    NUDGE_DOWN  = { 0,  1,  0,  1}
   }
-  mp.set_key_bindings(listeners, self.keybind_group, "force")
-  self:disable_key_bindings()
+
+  self.resizes = {
+    SHRINK_LEFT  = { 1,  0,  0,  0},
+    SHRINK_TOP   = { 0,  1,  0,  0},
+    SHRINK_RIGHT = { 0,  0, -1,  0},
+    SHRINK_BOT   = { 0,  0,  0, -1},
+
+    GROW_LEFT  = {-1,  0,  0,  0},
+    GROW_TOP   = { 0, -1,  0,  0},
+    GROW_RIGHT = { 0,  0,  1,  0},
+    GROW_BOT   = { 0,  0,  0,  1},
+  }
+
+  self._key_binds = {
+    {"mouse_move", function()  self:update_mouse_position() end },
+    {"mouse_btn0", function(e) self:on_mouse("mouse_btn0", e) end, {complex=true}},
+    {"shift+mouse_btn0", function(e) self:on_mouse("mouse_btn0", e, true) end, {complex=true}},
+
+    {"c", function() self:key_event("CROSSHAIR")   end },
+    {"d", function() self:key_event("CROP_DETECT") end },
+    {"x", function() self:key_event("GUIDES")      end },
+    {"t", function() self:key_event("TEST")        end },
+    {"z", function() self:key_event("INVERT")      end },
+
+    {"shift+left",  function() self:key_event("NUDGE_LEFT")  end, {repeatable=true} },
+    {"shift+up",    function() self:key_event("NUDGE_UP")    end, {repeatable=true} },
+    {"shift+right", function() self:key_event("NUDGE_RIGHT") end, {repeatable=true} },
+    {"shift+down",  function() self:key_event("NUDGE_DOWN")  end, {repeatable=true} },
+
+    {"ctrl+left",  function() self:key_event("GROW_LEFT")  end, {repeatable=true} },
+    {"ctrl+up",    function() self:key_event("GROW_TOP")   end, {repeatable=true} },
+    {"ctrl+right", function() self:key_event("SHRINK_LEFT") end, {repeatable=true} },
+    {"ctrl+down",  function() self:key_event("SHRINK_TOP")   end, {repeatable=true} },
+
+    {"ctrl+shift+left",  function() self:key_event("SHRINK_RIGHT")  end, {repeatable=true} },
+    {"ctrl+shift+up",    function() self:key_event("SHRINK_BOT")   end, {repeatable=true} },
+    {"ctrl+shift+right", function() self:key_event("GROW_RIGHT") end, {repeatable=true} },
+    {"ctrl+shift+down",  function() self:key_event("GROW_BOT")   end, {repeatable=true} },
+
+    {"ENTER", function() self:key_event("ENTER") end },
+    {"ESC",   function() self:key_event("ESC")   end }
+  }
+
+  self._keys_bound = false
+
+  for k, v in pairs(self._key_binds) do
+    -- Insert a key name into the tables
+    table.insert(v, 2, self.keybind_group .. "_key_" .. v[1])
+  end
 
   return self
 end
 
 function ASSCropper:enable_key_bindings()
-  mp.enable_key_bindings(self.keybind_group)
+  if not self._keys_bound then
+    for k, v in pairs(self._key_binds)  do
+      mp.add_forced_key_binding(unpack(v))
+    end
+    -- Clear "allow-vo-dragging"
+    mp.input_enable_section("input_forced_" .. mp.script_name)
+    self._keys_bound = true
+  end
 end
 
 function ASSCropper:disable_key_bindings()
-  mp.disable_key_bindings(self.keybind_group)
+  for k, v in pairs(self._key_binds)  do
+    mp.remove_key_binding(v[2]) -- remove by name
+  end
+  self._keys_bound = false
 end
 
 
@@ -105,10 +160,17 @@ function ASSCropper:finalize_crop()
     local y1, y2 = self.current_crop[1].y, self.current_crop[2].y
 
     self.current_crop.x, self.current_crop.y = x1, y1
-    self.current_crop.w, self.current_crop.h = x2 - x1, y2 -y1
+    self.current_crop.w, self.current_crop.h = x2 - x1, y2 - y1
 
-    self.current_crop.x1, self.current_crop.x2 = x1, x2
-    self.current_crop.y1, self.current_crop.y2 = y1, y2
+    if self.options.even_dimensions then
+      self.current_crop.w = self.current_crop.w - (self.current_crop.w % 2)
+      self.current_crop.h = self.current_crop.h - (self.current_crop.h % 2)
+    end
+
+    self.current_crop.x1, self.current_crop.x2 = x1, x1 + self.current_crop.w
+    self.current_crop.y1, self.current_crop.y2 = y1, y1 + self.current_crop.h
+
+    self.current_crop[2].x, self.current_crop[2].y = self.current_crop.x2, self.current_crop.y2
   end
 end
 
@@ -134,17 +196,65 @@ function ASSCropper:key_event(name)
       self.callback_on_cancel()
     end
 
-  elseif name == "CROP_DETECT" then
-    self:toggle_crop_detect()
+  elseif name == "TEST" then
+    self:toggle_testing()
 
-  elseif name == "CROSSHAIR" then
-    self.options.draw_mouse = not self.options.draw_mouse;
-  elseif name == "INVERT" then
-    self.options.color_invert = not self.options.color_invert;
-  elseif name == "GUIDES" then
-    self.options.guide_type = (self.options.guide_type + 1) % (self.guide_type_count)
-    mp.osd_message(self.guide_type_names[self.options.guide_type])
+  elseif not self.testing_crop then
+    if name == "CROP_DETECT" then
+      self:toggle_crop_detect()
+
+    elseif name == "CROSSHAIR" then
+      self.options.draw_mouse = not self.options.draw_mouse;
+    elseif name == "INVERT" then
+      self.options.color_invert = not self.options.color_invert;
+    elseif name == "GUIDES" then
+      self.options.guide_type = (self.options.guide_type + 1) % (self.guide_type_count)
+      mp.osd_message(self.guide_type_names[self.options.guide_type])
+    elseif self.nudges[name] then
+      self:nudge(true, unpack(self.nudges[name]))
+    elseif self.resizes[name] then
+      self:nudge(false, unpack(self.resizes[name]))
+    end
   end
+end
+
+function ASSCropper:nudge(keep_size, left, top, right, bottom)
+  if self.current_crop == nil then return end
+
+  local x1, y1 = self.current_crop[1].x, self.current_crop[1].y
+  local x2, y2 = self.current_crop[2].x, self.current_crop[2].y
+
+  local w, h = x2 - x1, y2 - y1
+  if not keep_size then
+    w, h = 0, 0
+
+    if self.options.even_dimensions then
+      left = left * 2
+      top = top * 2
+      right = right * 2
+      bottom = bottom * 2
+    end
+
+  end
+
+  local vw, vh = self.display_state.video.width, self.display_state.video.height
+
+  x1 = math.max(0, math.min(vw-w, x1 + left))
+  y1 = math.max(0, math.min(vh-h, y1 + top))
+
+  x2 = math.max(w, math.min(vw, x2 + right))
+  y2 = math.max(h, math.min(vh, y2 + bottom))
+
+  local x_offset = math.max(0, 0-x1) - math.max(0, x2-vw)
+  local y_offset = math.max(0, 0-y1) - math.max(0, y2-vh)
+
+  x1 = x1 + x_offset
+  y1 = y1 + y_offset
+  x2 = x2 + x_offset
+  y2 = y2 + y_offset
+
+  self.current_crop[1].x, self.current_crop[2].x = order_pair(x1, x2)
+  self.current_crop[1].y, self.current_crop[2].y = order_pair(y1, y2)
 end
 
 function ASSCropper:blackframe_stop()
@@ -162,6 +272,51 @@ function ASSCropper:blackframe_stop()
   end
 
 end
+
+function ASSCropper:toggle_testing()
+  if self.testing_crop then
+    self:stop_testing()
+  else
+    self:start_testing()
+  end
+end
+
+function ASSCropper:start_testing()
+  if not self.testing_crop then
+
+    local cw = self.current_crop and (self.current_crop[2].x - self.current_crop[1].x) or 0
+    local ch = self.current_crop and (self.current_crop[2].y - self.current_crop[1].y) or 0
+
+    if cw == 0 or ch == 0 then
+      return mp.osd_message("Can't test current crop")
+    end
+
+    self:cropdetect_stop()
+    self:blackframe_stop()
+
+    local crop_filter = ('@%s:crop=w=%d:h=%d:x=%d:y=%d'):format(
+      self.crop_label, cw, ch, self.current_crop[1].x, self.current_crop[1].y
+    )
+    local ret = mp.commandv('vf', 'add', crop_filter)
+    if ret then
+      self.testing_crop = true
+    end
+  end
+end
+
+function ASSCropper:stop_testing()
+  if self.testing_crop then
+    local filters = mp.get_property_native("vf")
+    for i, filter in ipairs(filters) do
+      if filter.label == self.crop_label then
+        table.remove(filters, i)
+      end
+    end
+    mp.set_property_native("vf", filters)
+    self.testing_crop = false
+  end
+end
+
 
 function ASSCropper:blackframe_check()
   local blackframe_metadata = mp.get_property_native("vf-metadata/" .. self.blackframe_label)
@@ -294,6 +449,7 @@ function ASSCropper:stop_crop(clear)
 
   self:cropdetect_stop()
   self:blackframe_stop()
+  self:stop_testing()
 
   self:disable_key_bindings()
   if clear then
@@ -428,11 +584,12 @@ function ASSCropper:hit_test(hitboxes, position)
 end
 
 
-function ASSCropper:on_mouse(button, mouse_down, shift_down)
-  mouse_down = mouse_down or false
+function ASSCropper:on_mouse(button, event, shift_down)
+  if not(event.event == "up" or event.event == "down") then return end
+  mouse_down = event.event == "down"
   shift_down = shift_down or false
 
-  if button == "mouse_btn0" and self.active and not self.detecting_crop then
+  if button == "mouse_btn0" and self.active and not self.detecting_crop and not self.testing_crop then
 
     local mouse_pos = {x=self.mouse_video.x, y=self.mouse_video.y}
 
@@ -539,7 +696,7 @@ function ASSCropper:offset_crop_by_drag()
   local anchor_positions = self:_get_anchor_positions()
 
   local handle = self.dragging
-  if self.dragging > 0 then
+  if handle > 0 then
     local ax, ay = self.anchor_pos[1], self.anchor_pos[2]
 
     local ox, oy = self.drag_offset[1], self.drag_offset[2]
@@ -778,10 +935,23 @@ function ASSCropper:get_render_ass(dim_only)
   end
 
   line_color = self.options.color_invert and 20 or 220
-  local guide_format = string.format("{\\3a&HFF&\\3a&H%02X&\\3c&H%02X%02X%02X&\\bord1}", 128, line_color, line_color, line_color)
+  local guide_format = string.format("{\\3a&HFF&\\3a&H%02X&\\3c&H%02X%02X%02X&\\bord1\\shad0}", 128, line_color, line_color, line_color)
 
   ass = assdraw.ass_new()
   if self.current_crop then
+
+    if self.testing_crop then
+      -- Just draw simple help
+      ass:new_event()
+      ass:pos(self.display_state.screen.width - 5, 5)
+      ass:append( string.format("{\\fs%d\\an%d\\bord2}", self.text_size, 9) )
+
+      local fmt_key = function( key, text ) return string.format("[{\\c&HBEBEBE&}%s{\\c} %s]", key:upper(), text) end
+
+      ass:append(fmt_key("ENTER", "Accept crop") .. " " .. fmt_key("ESC", "Cancel crop") .. '\\N' .. fmt_key("T", "Stop testing"))
+      return ass.text
+    end
+
     local temp_crop, drawn_handle = self:offset_crop_by_drag()
     local v_hb = self:get_hitboxes(temp_crop)
     -- Map coords to screen
@@ -967,9 +1137,9 @@ function ASSCropper:get_render_ass(dim_only)
 
     local crosshair_txt = self.options.draw_mouse and "Hide" or "Show";
     lines = {
-      fmt_key("ENTER", "Accept crop") .. " " .. fmt_key("ESC", "Cancel crop") .. " " .. fmt_key("D", "Autodetect crop"),
+      fmt_key("ENTER", "Accept crop") .. " " .. fmt_key("ESC", "Cancel crop") .. " " .. fmt_key("D", "Autodetect crop") .. " " .. fmt_key("T", "Test crop"),
+      fmt_key("SHIFT-Drag", "Constrain ratio") .. " " .. fmt_key("SHIFT-Arrow", "Nudge"),
       fmt_key("C", crosshair_txt .. " crosshair") .. " " .. fmt_key("X", "Cycle guides") .. " " .. fmt_key("Z", "Invert color"),
-      fmt_key("SHIFT-Drag", "Constrain ratio")
     }
 
     local full_line = nil
