@@ -24,53 +24,355 @@ function bmod( i, N )
   return (i % N + N) % N
 end
 
-function join_paths(...)
-  local sep = ON_WINDOWS and "\\" or "/"
-  local result = "";
-  for i, p in pairs({...}) do
-    if p ~= "" then
-      if is_absolute_path(p) then
-        result = p
-      else
-        result = (result ~= "") and (result:gsub("[\\"..sep.."]*$", "") .. sep .. p) or p
+
+-- Path utils
+local path_utils = {
+  abspath    = true,
+  split      = true,
+  dirname    = true,
+  basename   = true,
+
+  isabs      = true,
+  normcase   = true,
+  splitdrive = true,
+  join       = true,
+  normpath   = true,
+  relpath    = true,
+}
+
+-- Helpers
+path_utils._split_parts = function(path, sep)
+  local path_parts = {}
+  for c in path:gmatch('[^' .. sep .. ']+') do table.insert(path_parts, c) end
+  return path_parts
+end
+
+-- Common functions
+path_utils.abspath = function(path)
+  if not path_utils.isabs(path) then
+    local cwd = os.getenv("PWD") or utils.getcwd()
+    path = path_utils.join(cwd, path)
+  end
+  return path_utils.normpath(path)
+end
+
+path_utils.split = function(path)
+  local drive, path = path_utils.splitdrive(path)
+  -- Technically unix path could contain a \, but meh
+  local first_index, last_index = path:find('^.*[/\\]')
+
+  if last_index == nil then
+    return drive .. '', path
+  else
+    local head = path:sub(0, last_index-1)
+    local tail = path:sub(last_index+1)
+    if head == '' then head = sep end
+    return drive .. head, tail
+  end
+end
+
+path_utils.dirname = function(path)
+  local head, tail = path_utils.split(path)
+  return head
+end
+
+path_utils.basename = function(path)
+  local head, tail = path_utils.split(path)
+  return tail
+end
+
+path_utils.expanduser = function(path)
+  -- Expands the following from the start of the path:
+  -- ~ to HOME
+  -- ~~ to mpv config directory (first result of mp.find_config_file('.'))
+  -- ~~desktop to Windows desktop, otherwise HOME
+  -- ~~temp to Windows temp or /tmp/
+
+  local first_index, last_index = path:find('^.-[/\\]')
+  local head = path
+  local tail = ''
+
+  local sep = ''
+
+  if last_index then
+    head = path:sub(0, last_index-1)
+    tail = path:sub(last_index+1)
+    sep  = path:sub(last_index, last_index)
+  end
+
+  if head == "~~desktop" then
+    head = ON_WINDOWS and path_utils.join(os.getenv('USERPROFILE'), 'Desktop') or os.getenv('HOME')
+  elseif head == "~~temp" then
+    head = ON_WINDOWS and os.getenv('TEMP') or (os.getenv('TMP') or '/tmp/')
+  elseif head == "~~" then
+    local mpv_config_dir = mp.find_config_file('.')
+    if mpv_config_dir then
+      head = path_utils.dirname(mpv_config_dir)
+    else
+      msg.warn('Could not find mpv config directory (using mp.find_config_file), using temp instead')
+      head = ON_WINDOWS and os.getenv('TEMP') or (os.getenv('TMP') or '/tmp/')
+    end
+  elseif head == "~" then
+    head = ON_WINDOWS and os.getenv('USERPROFILE') or os.getenv('HOME')
+  end
+
+  return path_utils.normpath(path_utils.join(head .. sep, tail))
+end
+
+
+if ON_WINDOWS then
+  local sep = '\\'
+  local altsep = '/'
+  local curdir = '.'
+  local pardir = '..'
+  local colon = ':'
+
+  local either_sep = function(c) return c == sep or c == altsep end
+
+  path_utils.isabs = function(path)
+    local prefix, path = path_utils.splitdrive(path)
+    return either_sep(path:sub(1,1))
+  end
+
+  path_utils.normcase = function(path)
+    return path:gsub(altsep, sep):lower()
+  end
+
+  path_utils.splitdrive = function(path)
+    if #path >= 2 then
+      local norm = path:gsub(altsep, sep)
+      if (norm:sub(1, 2) == (sep..sep)) and (norm:sub(3,3) ~= sep) then
+        -- UNC path
+        local index = norm:find(sep, 3)
+        if not index then
+          return '', path
+        end
+
+        local index2 = norm:find(sep, index + 1)
+        if index2 == index + 1 then
+          return '', path
+        elseif not index2 then
+          index2 = path:len()
+        end
+
+        return path:sub(1, index2-1), path:sub(index2)
+      elseif norm:sub(2,2) == colon then
+        return path:sub(1, 2), path:sub(3)
       end
     end
+    return '', path
   end
-  return result:gsub("[\\"..sep.."]*$", "")
-end
 
--- /some/path/file.ext -> /some/path, file.ext
-function split_path( path )
-  local sep = ON_WINDOWS and "\\" or "/"
-  local first_index, last_index = path:find('^.*' .. sep)
+  path_utils.join = function(path, ...)
+    local paths = {...}
 
-  if last_index == nil then
-    return "", path
-  else
-    local dir = path:sub(0, last_index-1)
-    local file = path:sub(last_index+1, -1)
+    local result_drive, result_path = path_utils.splitdrive(path)
 
-    return dir, file
+    function inner(p)
+      local p_drive, p_path = path_utils.splitdrive(p)
+      if either_sep(p_path:sub(1,1)) then
+        -- Path is absolute
+        if p_drive ~= '' or result_drive == '' then
+          result_drive = p_drive
+        end
+        result_path = p_path
+        return
+      elseif p_drive ~= '' and p_drive ~= result_drive then
+        if p_drive:lower() ~= result_drive:lower() then
+          -- Different paths, ignore first
+          result_drive = p_drive
+          result_path = p_path
+          return
+        end
+      end
+
+      if result_path ~= '' and not either_sep(result_path:sub(-1)) then
+        result_path = result_path .. sep
+      end
+      result_path = result_path .. p_path
+    end
+
+    for i, p in ipairs(paths) do inner(p) end
+
+    -- add separator between UNC and non-absolute path
+    if result_path ~= '' and not either_sep(result_path:sub(1,1)) and
+      result_drive ~= '' and result_drive:sub(-1) ~= colon then
+      return result_drive .. sep .. result_path
+    end
+    return result_drive .. result_path
   end
-end
 
--- some_file.name => some_file, name
--- .somefile => .somefile, ""
-function split_extension( filename )
-  local first_index, last_index = filename:find('^.+%.')
+  path_utils.normpath = function(path)
+    if path:find('\\\\.\\', nil, true) == 1 or path:find('\\\\?\\', nil, true) == 1 then
+      -- Device names and literal paths - return as-is
+      return path
+    end
 
-  if last_index == nil then
-    return filename, ""
-  else
-    return filename:sub(0, last_index-1), filename:sub(last_index+1)
+    path = path:gsub(altsep, sep)
+    local prefix, path = path_utils.splitdrive(path)
+
+    if path:find(sep) == 1 then
+      prefix = prefix .. sep
+      path = path:gsub('^[\\]+', '')
+    end
+
+    local comps = path_utils._split_parts(path, sep)
+
+    local i = 1
+    while i <= #comps do
+      if comps[i] == curdir then
+        table.remove(comps, i)
+      elseif comps[i] == pardir then
+        if i > 1 and comps[i-1] ~= pardir then
+          table.remove(comps, i)
+          table.remove(comps, i-1)
+          i = i - 1
+        elseif i == 1 and prefix:match('\\$') then
+          table.remove(comps, i)
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    end
+
+    if prefix == '' and #comps == 0 then
+      comps[1] = curdir
+    end
+
+    return prefix .. table.concat(comps, sep)
   end
+
+  path_utils.relpath = function(path, start)
+    start = start or curdir
+
+    local start_abs = path_utils.abspath(path_utils.normpath(start))
+    local path_abs = path_utils.abspath(path_utils.normpath(path))
+
+    local start_drive, start_rest = path_utils.splitdrive(start_abs)
+    local path_drive, path_rest = path_utils.splitdrive(path_abs)
+
+    if path_utils.normcase(start_drive) ~= path_utils.normcase(path_drive) then
+      -- Different drives
+      return nil
+    end
+
+    local start_list = path_utils._split_parts(start_rest, sep)
+    local path_list = path_utils._split_parts(path_rest, sep)
+
+    local i = 1
+    for j = 1, math.min(#start_list, #path_list) do
+      if path_utils.normcase(start_list[j]) ~= path_utils.normcase(path_list[j]) then
+        break
+      end
+      i = j + 1
+    end
+
+    local rel_list = {}
+    for j = 1, (#start_list - i + 1) do rel_list[j] = pardir end
+    for j = i, #path_list do table.insert(rel_list, path_list[j]) end
+
+    if #rel_list == 0 then
+      return curdir
+    end
+
+    return path_utils.join(unpack(rel_list))
+  end
+
+else
+  -- LINUX
+  local sep = '/'
+  local curdir = '.'
+  local pardir = '..'
+
+  path_utils.isabs = function(path) return path:sub(1,1) == '/' end
+  path_utils.normcase = function(path) return path end
+  path_utils.splitdrive = function(path) return '', path end
+
+  path_utils.join = function(path, ...)
+    local paths = {...}
+
+    for i, p in ipairs(paths) do
+      if p:sub(1,1) == sep then
+        path = p
+      elseif path == '' or path:sub(-1) == sep then
+        path = path .. p
+      else
+        path = path .. sep .. p
+      end
+    end
+
+    return path
+  end
+
+  path_utils.normpath = function(path)
+    if path == '' then return curdir end
+
+    local initial_slashes = (path:sub(1,1) == sep) and 1
+    if initial_slashes and path:sub(2,2) == sep and path:sub(3,3) ~= sep then
+      initial_slashes = 2
+    end
+
+    local comps = path_utils._split_parts(path, sep)
+    local new_comps = {}
+
+    for i, comp in ipairs(comps) do
+      if comp == '' or comp == curdir then
+        -- pass
+      elseif (comp ~= pardir or (not initial_slashes and #new_comps == 0) or
+        (#new_comps > 0 and new_comps[#new_comps] == pardir)) then
+        table.insert(new_comps, comp)
+      elseif #new_comps > 0 then
+        table.remove(new_comps)
+      end
+    end
+
+    comps = new_comps
+    path = table.concat(comps, sep)
+    if initial_slashes then
+      path = sep:rep(initial_slashes) .. path
+    end
+
+    return (path ~= '') and path or curdir
+  end
+
+  path_utils.relpath = function(path, start)
+    start = start or curdir
+
+    local start_abs = path_utils.abspath(path_utils.normpath(start))
+    local path_abs = path_utils.abspath(path_utils.normpath(path))
+
+    local start_list = path_utils._split_parts(start_abs, sep)
+    local path_list = path_utils._split_parts(path_abs, sep)
+
+    local i = 1
+    for j = 1, math.min(#start_list, #path_list) do
+      if start_list[j] ~= path_list[j] then break
+      end
+      i = j + 1
+    end
+
+    local rel_list = {}
+    for j = 1, (#start_list - i + 1) do rel_list[j] = pardir end
+    for j = i, #path_list do table.insert(rel_list, path_list[j]) end
+
+    if #rel_list == 0 then
+      return curdir
+    end
+
+    return path_utils.join(unpack(rel_list))
+  end
+
+end
+-- Path utils end
+
+-- Check if path is local (by looking if it's prefixed by a proto://)
+local path_is_local = function(path)
+  local proto = path:match('(..-)://')
+  return proto == nil
 end
 
-function is_absolute_path( path )
-  local tmp, is_win  = path:gsub("^[A-Z]:\\", "")
-  local tmp, is_unix = path:gsub("^/", "")
-  return (is_win > 0) or (is_unix > 0)
-end
 
 function Set(source)
   local set = {}
@@ -82,6 +384,15 @@ end
 -- More helper functions --
 ---------------------------
 
+function busy_wait(seconds)
+  local target = mp.get_time() + seconds
+  local cycles = 0
+  while target > mp.get_time() do
+    cycles = cycles + 1
+  end
+  return cycles
+end
+
 -- Removes all keys from a table, without destroying the reference to it
 function clear_table(target)
   for key, value in pairs(target) do
@@ -89,9 +400,25 @@ function clear_table(target)
   end
 end
 function shallow_copy(target)
+  if type(target) == "table" then
+    local copy = {}
+    for k, v in pairs(target) do
+      copy[k] = v
+    end
+    return copy
+  else
+    return target
+  end
+end
+
+function deep_copy(target)
   local copy = {}
   for k, v in pairs(target) do
-    copy[k] = v
+    if type(v) == "table" then
+      copy[k] = deep_copy(v)
+    else
+      copy[k] = v
+    end
   end
   return copy
 end
@@ -126,12 +453,53 @@ end
 function create_directories(path)
   local cmd
   if ON_WINDOWS then
-    cmd = { args = {"cmd", "/c", "mkdir", path} }
+    cmd = { args = {'cmd', '/c', 'mkdir', path} }
   else
-    cmd = { args = {"mkdir", "-p", path} }
+    cmd = { args = {'mkdir', '-p', path} }
   end
   utils.subprocess(cmd)
 end
+
+function move_file(source_path, target_path)
+  local cmd
+  if ON_WINDOWS then
+    cmd = { cancellable=false, args = {'cmd', '/c', 'move', '/Y', source_path, target_path } }
+    utils.subprocess(cmd)
+  else
+    -- cmd = { cancellable=false, args = {'mv', source_path, target_path } }
+    os.rename(source_path, target_path)
+  end
+end
+
+function check_pid(pid)
+  -- Checks if a PID exists and returns true if so
+  local cmd, r
+  if ON_WINDOWS then
+    cmd = { cancellable=false, args = {
+      'tasklist', '/FI', ('PID eq %d'):format(pid)
+    }}
+    r = utils.subprocess(cmd)
+    return r.stdout:sub(1,1) == '\13'
+  else
+    cmd = { cancellable=false, args = {
+      'sh', '-c', ('kill -0 %d 2>/dev/null'):format(pid)
+    }}
+    r = utils.subprocess(cmd)
+    return r.status == 0
+  end
+end
+
+function kill_pid(pid)
+  local cmd, r
+  if ON_WINDOWS then
+    cmd = { cancellable=false, args = {'taskkill', '/F', '/PID', tostring(pid) } }
+  else
+    cmd = { cancellable=false, args = {'kill', tostring(pid) } }
+  end
+  r = utils.subprocess(cmd)
+  return r.status == 0, r
+end
+
 
 -- Find an executable in PATH or CWD with the given name
 function find_executable(name)
@@ -144,7 +512,7 @@ function find_executable(name)
 
   local result, filename
   for path_dir in env_path:gmatch("[^"..delim.."]+") do
-    filename = join_paths(path_dir, name)
+    filename = path_utils.join(path_dir, name)
     if file_exists(filename) then
       result = filename
       break
@@ -168,7 +536,7 @@ end
 -- Format seconds to HH.MM.SS.sss
 function format_time(seconds, sep, decimals)
   decimals = decimals == nil and 3 or decimals
-  sep = sep and sep or "."
+  sep = sep and sep or ":"
   local s = seconds
   local h, s = divmod(s, 60*60)
   local m, s = divmod(s, 60)
