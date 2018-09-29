@@ -89,6 +89,78 @@ end
 
 
 function PropertyExpander:expand(format_string)
+  local comparisons = {
+    {
+      -- Less than or equal
+      '^(..-)<=(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "number" then return nil end
+        return property_value <= tonumber(other_value)
+      end
+    },
+    {
+      -- More than or equal
+      '^(..-)>=(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "number" then return nil end
+        return property_value >= tonumber(other_value)
+      end
+    },
+    {
+      -- Less than
+      '^(..-)<(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "number" then return nil end
+        return property_value < tonumber(other_value)
+      end
+    },
+    {
+      -- More than
+      '^(..-)>(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "number" then return nil end
+        return property_value > tonumber(other_value)
+      end
+    },
+    {
+      -- Equal
+      '^(..-)==(.+)$',
+      function(property_value, other_value)
+        if type(property_value) == "number" then
+          other_value = tonumber(other_value)
+        elseif type(property_value) ~= "string" then
+          -- Ignore booleans and others
+          return nil
+        end
+        return property_value == other_value
+      end
+    },
+    {
+      -- Starts with
+      '^(..-)^=(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "string" then return nil end
+        return property_value:sub(1, other_value:len()) == other_value
+      end
+    },
+    {
+      -- Ends with
+      '^(..-)$=(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "string" then return nil end
+        return other_value == '' or property_value:sub(-other_value:len()) == other_value
+      end
+    },
+    {
+      -- Contains
+      '^(..-)~=(.+)$',
+      function(property_value, other_value)
+        if type(property_value) ~= "string" then return nil end
+        return property_value:find(other_value, nil, true) ~= nil
+      end
+    },
+  }
+
   local substitutor = function(match)
     local command, inner = match:sub(3, -2):match('^([%?!~^%%#&]?)(.+)$')
     local colon_index = inner:find(':')
@@ -102,11 +174,27 @@ function PropertyExpander:expand(format_string)
       secondary = inner:sub(colon_index+1, -1)
     end
 
+    local used_comparison = nil
+    local comparison_value = nil
+    for i, comparison in ipairs(comparisons) do
+      local name, other_value = property_name:match(comparison[1])
+      if name then
+        property_name = name
+        comparison_value = other_value
+        used_comparison = comparison[2]
+        break
+      end
+    end
 
     local raw_property_value = self.property_source:get_raw_property(property_name, self.sentinel)
     local property_exists = raw_property_value ~= self.sentinel
 
     if command == '' then
+      if used_comparison then
+        if used_comparison(raw_property_value, comparison_value) then return self:expand(secondary)
+        else return '' end
+      end
+
       -- Return the property value if it's not nil, else the (expanded) secondary
       return property_exists and self.property_source:get_property(property_name) or self:expand(secondary)
 
@@ -116,6 +204,11 @@ function PropertyExpander:expand(format_string)
       if not isempty(raw_property_value) then return self:expand(secondary) else return '' end
 
     elseif command == '!' then
+      if used_comparison then
+        if not used_comparison(raw_property_value, comparison_value) then return self:expand(secondary)
+        else return '' end
+      end
+
       -- Return (expanded) secondary if property is falsey
       if isempty(raw_property_value) then return self:expand(secondary) else return '' end
 
@@ -146,7 +239,8 @@ function PropertyExpander:expand(format_string)
   end
 
   -- Lua patterns are generally a pain, but %b is comfy!
-  return format_string:gsub('%$%b{}', substitutor)
+  local expanded = format_string:gsub('%$%b{}', substitutor)
+  return expanded
 end
 
 
