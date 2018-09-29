@@ -1,8 +1,8 @@
 --[[
   A slightly more advanced option parser for scripts.
-  It supports documnting the options, and can export an example config.
+  It supports documenting the options, and can export an example config.
   It also can rewrite the config file with overrides, preserving the
-  originallines and appending to the end.
+  original lines and appending changes to the end, along with profiles.
 
   Does not depend on other libs.
 ]]--
@@ -20,49 +20,78 @@ function OptionParser.new(identifier)
   self.identifier = identifier
   self.config_file = self:_get_config_file(identifier)
 
-  self.config_lines = {}
   self.OVERRIDE_START = "# Script-saved overrides below this line. Edits will be lost!"
 
   -- All the options contained, as a list
   self.options_list = {}
-  -- All the options contained, as a table with keys
+  -- All the options contained, as a table with keys. See add_option
   self.options = {}
 
-  --[[ Example option:
-  {
-    index = 1, -- Added automatically
-    type  = "string",
-    key   = "some_option",
-    default = "default value",
-    name  = "Some option",
-    description  = "Describes the option",
+  self.default_profile = {name = "default", values = {}, loaded={}, config_lines = {}}
+  self.profiles = {}
 
-    -- Current value
-    value = "current value",
-    -- Value loaded from .conf, or nil
-    loaded = "current value"
-  }
-  ]]--
+  self.active_profile = self.default_profile
 
+  -- Recusing metatable magic to wrap self.values.key.sub_key into
+  -- self.options["key.sub_key"].value, with support for assignments as well
+  function get_value_or_mapper(key)
+    local cur_option = self.options[key]
 
-  -- Easy lookups
+    if cur_option then
+      -- Wrap tables
+      if cur_option.type == "table" then
+        return setmetatable({}, {
+          __index = function(t, sub_key)
+            return get_value_or_mapper(key .. "." .. sub_key)
+          end,
+          __newindex = function(t, sub_key, value)
+            local sub_option = self.options[key .. "." .. sub_key]
+            if sub_option and sub_option.type ~= "table" then
+              self.active_profile.values[key .. "." .. sub_key] = value
+            end
+          end
+        })
+      else
+        return self.active_profile.values[key]
+      end
+    end
+  end
+
+  -- Same recusing metatable magic to get the .default
+  function get_default_or_mapper(key)
+    local cur_option = self.options[key]
+
+    if cur_option then
+      if cur_option.type == "table" then
+        return setmetatable({}, {
+          __index = function(t, sub_key)
+            return get_default_or_mapper(key .. "." .. sub_key)
+          end,
+        })
+      else
+        return cur_option.default
+        -- return self.active_profile.values[key]
+      end
+    end
+  end
+
+  -- Easy lookups for values and defaults
   self.values = setmetatable({}, {
-    __index = function(t, name)
-      local option = self.options[name]
-      return option ~= nil and option.value or nil
+    __index = function(t, key)
+      return get_value_or_mapper(key)
     end,
-    __newindex = function(t, name, value)
-      local option = self.options[name]
+    __newindex = function(t, key, value)
+      local option = self.options[key]
       if option then
-        option.value = value
+        -- option.value = value
+        self.active_profile.values[key] = value
       end
     end
   })
 
   self.defaults = setmetatable({}, {
-    __index = function(t, name)
-      local option = self.options[name]
-      return option ~= nil and option.default or nil
+    __index = function(t, key)
+      return get_default_or_mapper(key)
     end
   })
 
@@ -73,14 +102,38 @@ function OptionParser.new(identifier)
     if example_dump_filename then
       self:save_example_options(example_dump_filename)
 
-      if mp.get_property_native("options/idle") then
+    end
+    local explain_config = mp.get_opt(self.identifier .. "-explain-config")
+    if explain_config then
+      self:explain_options()
+    end
+
+    if (example_dump_filename or explain_config) and mp.get_property_native("options/idle") then
         msg.info("Exiting.")
         mp.commandv("quit")
       end
-    end
   end)
 
   return self
+end
+
+function OptionParser:activate_profile(profile_name)
+  local chosen_profile = nil
+  if profile_name then
+    for i, profile in ipairs(self.profiles) do
+      if profile.name == profile_name then
+        chosen_profile = profile
+        break
+      end
+    end
+  else
+    chosen_profile = self.default_profile
+  end
+
+  if chosen_profile then
+    self.active_profile = chosen_profile
+  end
+
 end
 
 function OptionParser:add_option(key, default, description, pad_before)
@@ -92,25 +145,46 @@ function OptionParser:add_option(key, default, description, pad_before)
   local option_index = #self.options_list + 1
   local option_type = type(default)
 
+  -- Check if option is an array
+  if option_type == "table" then
+    if default._array then
+      option_type = "array"
+    end
+    default._array = nil
+  end
+
   local option = {
     index = option_index,
-    type = option_type, key = key,
+    type = option_type,
+    key = key,
     default = default,
-    -- name = name,
-    description = description,
-    pad_before = pad_before,
 
-    value = default,
-    loaded = nil
+    description = description,
+    pad_before = pad_before
   }
 
   self.options_list[option_index] = option
+
+  -- table-options are just containers for sub-options and have no value
+  if option_type == "table" then
+    option.default = nil
+
+    -- Add sub-options
+    for i, sub_option_data in ipairs(default) do
+      local sub_key = sub_option_data[1]
+      sub_option_data[1] = key .. "." .. sub_key
+      local sub_option = self:add_option(unpack(sub_option_data))
+    end
+  end
+
   if key then
     self.options[key] = option
+    self.default_profile.values[option.key] = option.default
   end
 
   return option
 end
+
 
 function OptionParser:add_options(list_of_options)
   for i, option_args in ipairs(list_of_options) do
@@ -121,9 +195,23 @@ end
 
 function OptionParser:restore_defaults()
   for key, option in pairs(self.options) do
-    option.value = option.default
+    if option.type ~= "table" then
+      self.active_profile.values[option.key] = option.default
+    end
   end
 end
+
+function OptionParser:restore_loaded()
+  for key, option in pairs(self.options) do
+    if option.type ~= "table" then
+      -- Non-default profiles will have an .loaded entry for all options
+      local value = self.active_profile.loaded[option.key]
+      if value == nil then value = option.default end
+      self.active_profile.values[option.key] = value
+    end
+  end
+end
+
 
 function OptionParser:_get_config_file(identifier)
   local config_filename = "script-opts/" .. identifier .. ".conf"
@@ -141,12 +229,16 @@ function OptionParser:_get_config_file(identifier)
   return config_file
 end
 
+
 function OptionParser:value_to_string(value)
   if type(value) == "boolean" then
     if value then value = "yes" else value = "no" end
+  elseif type(value) == "table" then
+    return utils.format_json(value)
   end
   return tostring(value)
 end
+
 
 function OptionParser:string_to_value(option_type, value)
   if option_type == "boolean" then
@@ -163,100 +255,204 @@ function OptionParser:string_to_value(option_type, value)
     if value == nil then
       -- Can't parse as number
     end
+  elseif option_type == "array" then
+    value = utils.parse_json(value)
   end
   return value
 end
 
-function OptionParser:_trim(text)
-  return (text:gsub("^%s*(.-)%s*$", "%1"))
+
+function OptionParser:get_profile(profile_name)
+  for i, profile in ipairs(self.profiles) do
+    if profile.name == profile_name then
+      return profile
+    end
+  end
 end
+
+
+function OptionParser:create_profile(profile_name, base_on_original)
+  if not self:get_profile(profile_name) then
+    new_profile = {name = profile_name, values={}, loaded={}, config_lines={}}
+
+    if base_on_original then
+      -- Copy values from default config
+      for k, v in pairs(self.default_profile.values) do
+        new_profile.values[k] = v
+      end
+      for k, v in pairs(self.default_profile.loaded) do
+        new_profile.loaded[k] = v
+      end
+    else
+      -- Copy current values, but not loaded
+      for k, v in pairs(self.active_profile.values) do
+        new_profile.values[k] = v
+      end
+    end
+
+    table.insert(self.profiles, new_profile)
+    return new_profile
+  end
+end
+
 
 function OptionParser:load_options()
   if not self.config_file then return end
   local file = io.open(self.config_file, 'r')
   if not file then return end
 
+  local trim = function(text)
+    return (text:gsub("^%s*(.-)%s*$", "%1"))
+  end
+
+  local current_profile = self.default_profile
   local override_reached = false
   local line_index = 1
 
+  -- Read all lines in advance
+  local lines = {}
   for line in file:lines() do
+    table.insert(lines, line)
+  end
+  file:close()
+
+  local total_lines = #lines
+
+  while line_index < total_lines + 1 do
+    local line = lines[line_index]
+
+    local profile_name = line:match("^%[(..-)%]$")
+
     if line == self.OVERRIDE_START then
       override_reached = true
+
     elseif line:find("#") == 1 then
       -- Skip comments
+    elseif profile_name then
+      current_profile = self:get_profile(profile_name) or self:create_profile(profile_name, true)
+      override_reached = false
+
     else
       local key, value = line:match("^(..-)=(.+)$")
       if key then
-        key = self:_trim(key)
-        value = self:_trim(value)
+        key = trim(key)
+        value = trim(value)
 
         local option = self.options[key]
         if not option then
           msg.warn(("%s:%d ignoring unknown key '%s'"):format(self.config_file, line_index, key))
+        elseif option.type == "table" then
+            msg.warn(("%s:%d ignoring value for table-option %s"):format(self.config_file, line_index, key))
         else
+          -- If option is an array, make sure we read all lines
+          if option.type == "array" then
+            local start_index = line_index
+            -- Read lines until one ends with ]
+            while not value:match("%]%s*$") do
+              line_index = line_index + 1
+              if line_index > total_lines then
+                msg.error(("%s:%d non-ending %s for key '%s'"):format(self.config_file, start_index, option.type, key))
+              end
+              value = value .. trim(lines[line_index])
+            end
+          end
           local parsed_value = self:string_to_value(option.type, value)
 
           if parsed_value == nil then
             msg.error(("%s:%d error parsing value '%s' for key '%s' (as %s)"):format(self.config_file, line_index, value, key, option.type))
           else
-            option.value = parsed_value
+            current_profile.values[option.key] = parsed_value
             if not override_reached then
-              option.loaded = parsed_value
+              current_profile.loaded[option.key] = parsed_value
             end
           end
         end
       end
     end
 
-    if not override_reached then
-      -- Store original lines
-      self.config_lines[line_index] = line
+    if not override_reached and not profile_name then
+      table.insert(current_profile.config_lines, line)
     end
 
     line_index = line_index + 1
   end
-
-  file:close()
 end
+
 
 function OptionParser:save_options()
-  if not self.config_file then return end
+  if not self.config_file then return nil, "no configuration file found" end
 
-  -- Check if we have overriden values
-  local override_lines = {}
-  for option_index, option in ipairs(self.options_list) do
-    -- If value is different from default AND loaded value, store it in array
-    if option.key and option.value ~= option.default and (option.loaded == nil or option.value ~= option.loaded) then
-      table.insert(override_lines, ('%s=%s'):format(option.key, self:value_to_string(option.value)))
+  local file = io.open(self.config_file, 'w')
+  if not file then return nil, "unable to open configuration file for writing" end
+
+  local profiles = {self.default_profile}
+  for i, profile in ipairs(self.profiles) do
+    table.insert(profiles, profile)
+  end
+
+  local out_lines = {}
+
+  local add_linebreak = function()
+    if out_lines[#out_lines] ~= '' then
+      table.insert(out_lines, '')
     end
   end
 
-  -- Don't rewrite unless we have any reason to
-  if #override_lines > 0 then
-    local file = io.open(self.config_file, 'w')
-    if not file then return end
+  for profile_index, profile in ipairs(profiles) do
 
-    if #self.config_lines > 0 then
-      -- Write original config lines
-      for line_index, line in ipairs(self.config_lines) do
-        file:write(line .. '\n')
+    local profile_override_lines = {}
+    for option_index, option in ipairs(self.options_list) do
+      local option_value = profile.values[option.key]
+      local option_loaded = profile.loaded[option.key]
+
+      if option_loaded == nil then
+        option_loaded = self.default_profile.loaded[option.key]
+      end
+      if option_loaded == nil then
+        option_loaded = option.default
       end
 
-      -- Add a newline before the override comment if needed
-      if self.config_lines[#self.config_lines] ~= '' then
-        file:write('\n')
+      -- If value is different from default AND loaded value, store it in array
+      if option.key then
+        if (option_value ~= option_loaded) then
+          table.insert(profile_override_lines, ('%s=%s'):format(option.key, self:value_to_string(option_value)))
+        end
       end
     end
 
-    file:write(self.OVERRIDE_START .. '\n')
-    for override_line_index, override_line in ipairs(override_lines) do
-      file:write(override_line .. '\n')
+    if (#profile.config_lines > 0 or #profile_override_lines > 0) and profile ~= self.default_profile then
+      -- Write profile name, if this is not default profile
+      add_linebreak()
+      table.insert(out_lines, ("[%s]"):format(profile.name))
     end
 
-    file:close()
+    -- Write original config lines
+    for line_index, line in ipairs(profile.config_lines) do
+      table.insert(out_lines, line)
+    end
+    -- end
+
+    if #profile_override_lines > 0 then
+      -- Add another newline before the override comment, if needed
+      add_linebreak()
+
+      table.insert(out_lines, self.OVERRIDE_START)
+      for override_line_index, override_line in ipairs(profile_override_lines) do
+        table.insert(out_lines, override_line)
+      end
+    end
+
   end
 
+  -- Add a final linebreak if needed
+  add_linebreak()
+
+  file:write(table.concat(out_lines, "\n"))
+  file:close()
+
+  return true
 end
+
 
 function OptionParser:get_default_config_lines()
   local example_config_lines = {}
@@ -271,17 +467,19 @@ function OptionParser:get_default_config_lines()
         table.insert(example_config_lines, ('# ' .. description_line))
       end
     end
-    if option.key then
+    if option.key and option.type ~= "table" then
       table.insert(example_config_lines, ('%s=%s'):format(option.key, self:value_to_string(option.default)) )
     end
   end
   return example_config_lines
 end
 
+
 function OptionParser:explain_options()
   local example_config_lines = self:get_default_config_lines()
   msg.info(table.concat(example_config_lines, '\n'))
 end
+
 
 function OptionParser:save_example_options(filename)
   local file = io.open(filename, "w")
