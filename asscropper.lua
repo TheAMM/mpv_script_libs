@@ -1118,11 +1118,13 @@ function ASSCropper:get_render_ass(dim_only)
     ass:append( guide_format )
     ass:draw_start()
 
-    ass:move_to(self.mouse_screen.x, 0)
-    ass:line_to(self.mouse_screen.x, self.display_state.screen.height)
+    local mx, my = self.display_state:video_to_screen(math.floor(self.mouse_video.x), math.floor(self.mouse_video.y))
 
-    ass:move_to(0, self.mouse_screen.y)
-    ass:line_to(self.display_state.screen.width, self.mouse_screen.y)
+    ass:move_to(mx, 0)
+    ass:line_to(mx, self.display_state.screen.height)
+
+    ass:move_to(0, my)
+    ass:line_to(self.display_state.screen.width, my)
 
     ass:draw_stop()
   end
