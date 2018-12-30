@@ -14,10 +14,12 @@ setmetatable(OptionParser, {
   __call = function (cls, ...) return cls.new(...) end
 })
 
-function OptionParser.new(identifier)
+function OptionParser.new(identifier, shorthand_identifier)
   local self = setmetatable({}, OptionParser)
 
   self.identifier = identifier
+  self.shorthand_identifier = shorthand_identifier
+
   self.config_file = self:_get_config_file(identifier)
 
   self.OVERRIDE_START = "# Script-saved overrides below this line. Edits will be lost!"
@@ -97,13 +99,17 @@ function OptionParser.new(identifier)
 
   -- Hacky way to run after the script is initialized and options (hopefully) added
   mp.add_timeout(0, function()
+    local get_opt_shorthand = function(key)
+      return mp.get_opt(self.identifier .. "-" .. key) or (self.shorthand_identifier and mp.get_opt(self.shorthand_identifier .. "-" .. key))
+    end
+
     -- Handle a '--script-opts identifier-example-config=example.conf' to save an example config to a file
-    local example_dump_filename = mp.get_opt(self.identifier .. "-example-config")
+    local example_dump_filename = get_opt_shorthand("example-config")
     if example_dump_filename then
       self:save_example_options(example_dump_filename)
-
     end
-    local explain_config = mp.get_opt(self.identifier .. "-explain-config")
+
+    local explain_config = get_opt_shorthand("explain-config")
     if explain_config then
       self:explain_options()
     end
@@ -297,12 +303,59 @@ end
 
 
 function OptionParser:load_options()
-  if not self.config_file then return end
-  local file = io.open(self.config_file, 'r')
-  if not file then return end
 
   local trim = function(text)
     return (text:gsub("^%s*(.-)%s*$", "%1"))
+  end
+
+  local script_opts_parsed = false
+  -- Function to parse --script-opts with. Defined here, so we can call it at multiple possible situations
+  local parse_script_opts = function()
+    if script_opts_parsed then return end
+
+    -- Checks if the given key starts with identifier or the shorthand_identifier and returns the prefix-less key
+    local check_prefix = function(key)
+      if key:find(self.identifier .. "-", 1, true) then
+        return key:sub(self.identifier:len()+2)
+      elseif key:find(self.shorthand_identifier .. "-", 1, true) then
+        return key:sub(self.shorthand_identifier:len()+2)
+      end
+    end
+
+    for key, value in pairs(mp.get_property_native("options/script-opts")) do
+      key = check_prefix(key)
+      if key then
+        -- Handle option value, trimmed down version of the above file reading
+        key = trim(key)
+        value = trim(value)
+
+        local option = self.options[key]
+        if not option then
+          if not (key == 'example-config' or key == 'explain-config') then
+            msg.warn(("script-opts: ignoring unknown key '%s'"):format(key))
+          end
+        elseif option.type == "table" then
+            msg.warn(("script-opts: ignoring value for table-option %s"):format(key))
+        else
+          local parsed_value = self:string_to_value(option.type, value)
+
+          if parsed_value == nil then
+            msg.error(("script-opts: error parsing value '%s' for key '%s' (as %s)"):format(value, key, option.type))
+          else
+            self.default_profile.values[option.key] = parsed_value
+            self.default_profile.loaded[option.key] = parsed_value
+          end
+        end
+      end
+    end
+
+    script_opts_parsed = true
+  end
+
+  local file = self.config_file and io.open(self.config_file, 'r')
+  if not file then
+    parse_script_opts()
+    return
   end
 
   local current_profile = self.default_profile
@@ -329,6 +382,8 @@ function OptionParser:load_options()
     elseif line:find("#") == 1 then
       -- Skip comments
     elseif profile_name then
+      -- Profile potentially changing, parse script-opts
+      parse_script_opts()
       current_profile = self:get_profile(profile_name) or self:create_profile(profile_name, true)
       override_reached = false
 
@@ -376,6 +431,10 @@ function OptionParser:load_options()
 
     line_index = line_index + 1
   end
+
+  -- Parse --script-opts if they weren't already
+  parse_script_opts()
+
 end
 
 
